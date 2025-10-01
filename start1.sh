@@ -1,23 +1,32 @@
 #!/bin/sh
 set -e
 
-# Alpine-friendly VM starter: create/resize disk, run qemu, start noVNC via websockify,
-# and (optionally) download cloudflared for quick tunnels.
+# Simple Alpine-ready VM starter script (QEMU + cloud-init + noVNC + cloudflared quick tunnel).
+# Giữ nguyên logic gốc, chỉ chuyển sang apk, pip, và fix 1 vài lệnh để chạy trên Alpine.
 #
-# Usage: run as root:
+# Usage:
 #   chmod +x setup-vm-alpine.sh
 #   ./setup-vm-alpine.sh
+#
+# Yêu cầu: chạy với quyền root và có Internet.
 
-# ---------- Config ----------
-echo "Bạn muốn bao nhiêu disk tùy máy (ví dụ muốn 128G thì nhập 128)"
+echo "Code By SNIPA VN"
+
+# ---------- Ask user for disk size ----------
+echo "Bạn muốn bao nhiêu disk tùy máy (ví dụ muốn 128G thì nhập 128):"
 read disk1
+if [ -z "$disk1" ]; then
+  echo "Bạn chưa nhập dung lượng. Thoát."
+  exit 1
+fi
+
+# ---------- Paths & defaults ----------
 DISK_DIR="/data"
 DISK="$DISK_DIR/vm.raw"
-IMG="/opt/qemu/ubuntu.img"       # bạn phải chuẩn bị file nguồn tại đây (qcow2)
-SEED="/opt/qemu/seed.iso"       # optional, nếu không có hãy bỏ
+IMG="/opt/qemu/ubuntu.img"       # bạn cần chuẩn bị file qcow2 ở đây (cloud image)
+SEED="/opt/qemu/seed.iso"       # optional cloud-init ISO (nếu có tạo)
 NOVNC_DIR="/opt/novnc"
 CLOUDFLARED_BIN="/usr/local/bin/cloudflared"
-TT_PORT=7681
 VNC_DISPLAY=":0"
 VNC_PORT=5900
 NOVNC_PORT=6080
@@ -26,11 +35,26 @@ NOVNC_PORT=6080
 mkdir -p "$DISK_DIR"
 mkdir -p /opt/qemu
 mkdir -p "$NOVNC_DIR"
+mkdir -p /cloud-init
 
 # ---------- Install dependencies (Alpine) ----------
 echo "[*] Cài dependencies bằng apk..."
 apk update
-apk add --no-cache curl bash git python3 py3-pip qemu-system-x86_64 qemu-img
+apk add --no-cache \
+  curl \
+  bash \
+  git \
+  python3 \
+  py3-pip \
+  qemu-system-x86_64 \
+  qemu-img \
+  sudo \
+  genisoimage \
+  coreutils \
+  procps \
+  openssh-client \
+  net-tools \
+  netcat-openbsd
 
 # websockify (python) - install via pip if not present
 if ! command -v websockify >/dev/null 2>&1; then
@@ -45,10 +69,11 @@ if [ ! -d "$NOVNC_DIR" ] || [ ! -f "$NOVNC_DIR/vnc.html" ]; then
   git clone --depth 1 https://github.com/novnc/noVNC.git "$NOVNC_DIR"
 fi
 
-# cloudflared - download binary suitable cho kiến trúc
+# cloudflared - download binary suitable cho kiến trúc nếu chưa có
 if [ ! -x "$CLOUDFLARED_BIN" ]; then
-  echo "[*] Tải cloudflared binary..."
+  echo "[*] Tải cloudflared binary (nếu có internet và kiến trúc được hỗ trợ)..."
   arch="$(uname -m)"
+  cf_bin=""
   case "$arch" in
     x86_64|amd64) cf_bin="cloudflared-linux-amd64" ;;
     aarch64|arm64) cf_bin="cloudflared-linux-arm64" ;;
@@ -81,7 +106,6 @@ fi
 
 # ---------- Start VM ----------
 echo "[*] Khởi QEMU..."
-# nếu bạn muốn background, dùng -daemonize (giữ)
 qemu-system-x86_64 \
     -m 8G \
     -drive file="$DISK",format=raw,if=virtio \
@@ -93,23 +117,30 @@ qemu-system-x86_64 \
     -daemonize
 
 # ---------- Start noVNC/websockify ----------
-# websockify expects display port, so map VNC port (5900 + display)
 VNC_PORT_CALC=$VNC_PORT
 echo "[*] Start websockify to serve noVNC on http://0.0.0.0:$NOVNC_PORT ..."
 # kill existing if any on that port (best-effort)
-if pgrep -f "websockify .*${NOVNC_PORT}" >/dev/null 2>&1; then
+if command -v pgrep >/dev/null 2>&1 && pgrep -f "websockify .*${NOVNC_PORT}" >/dev/null 2>&1; then
   echo "[*] Found existing websockify on port $NOVNC_PORT - killing..."
   pkill -f "websockify .*${NOVNC_PORT}" || true
 fi
 
 # start websockify serving the noVNC web files
-# websockify <novnc_port> localhost:<vnc_port>
 nohup websockify --web="$NOVNC_DIR" "$NOVNC_PORT" "localhost:$VNC_PORT_CALC" > /var/log/websockify.log 2>&1 &
+
+# ---------- Get host IP for display ----------
+# Try to get the primary outbound IP
+HOST_IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){ if($i==\"src\"){print $(i+1); exit}} }')"
+if [ -z "$HOST_IP" ]; then
+  # fallback to hostname -I if available
+  HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+fi
+[ -z "$HOST_IP" ] && HOST_IP="127.0.0.1"
 
 # ---------- Output info ----------
 echo "================================================"
-echo " 🖥️  noVNC: http://$(hostname -I | awk '{print $1}'):${NOVNC_PORT}/vnc.html"
-echo " 🔐 SSH: ssh root@$(hostname -I | awk '{print $1}') -p 2222"
+echo " 🖥️  noVNC: http://${HOST_IP}:${NOVNC_PORT}/vnc.html"
+echo " 🔐 SSH: ssh root@${HOST_IP} -p 2222"
 echo " 🧾 Login: root / root (nếu OS image dùng mặc định)"
 echo " ⚙️  VM disk: $DISK (${DISK2}G)"
 echo " Supported Code Sandbox (use ngrok or cloudflared)"
